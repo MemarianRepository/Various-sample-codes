@@ -2,15 +2,23 @@
 
 namespace App\Http\Controllers\Api\v1;
 
+use App\Events\OrderVolumenScore;
+use App\Events\pay_commision;
+use App\Helpers\FreezeHelper;
+use App\Helpers\RequestHelper;
 use App\Helpers\SmsHelper;
 use App\Http\Controllers\Controller;
 use App\Models\Api\v1\BinanceCurrency;
 use App\Models\Api\v1\CoinexMarketInfoExtracted;
 use App\Models\Api\v1\DoneOrdersList;
+use App\Models\Api\v1\ExchangeList;
 use App\Models\Api\v1\ExchangeSetting;
+use App\Models\Api\v1\Income;
+use App\Models\Api\v1\IncomeLog;
 use App\Models\Api\v1\KucoinCurrency;
 use App\Models\Api\v1\OrdersList;
 use App\Models\Api\v1\OrdersLog;
+use App\Models\Api\v1\UsdtPrice;
 use App\Models\Currency;
 use App\Models\OrderSetting;
 use App\Repositories\Api\v1\OrderRepository;
@@ -19,7 +27,14 @@ use Illuminate\Http\Request;
 use App\Traits\SellExchangeTrait;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Response;
+use Elegant\Sanitizer\Sanitizer;
+use Illuminate\Support\Facades\Validator;
+use Lin\Coinex\CoinexExchange;
 
+/**
+ * @group Trade section
+ * Api to buy and sell currency
+ **/
 class SellExchangeController extends Controller
 {
     use SellExchangeTrait;
@@ -33,158 +48,220 @@ class SellExchangeController extends Controller
         $this->orderRepository = $orderRepository;
     }
 
-    public function sellExchange(Request $request)
+    public function market(Request $request)
     {
-        $tetherPrice = 30000;
-        $static_percent = 0.3;
 
-        if ($request->type == 'market') {
-//          Market invoice or sell tether
-            if ($request->pair_type == 'USDT' || $request->pair_type == 'usdt') {
-                $total_price = $request->pair_amount * $tetherPrice;
-                $data = [
-                    'your_payment' => $request->pair_amount,
-                    'wage_percent' => 0,
-                    'your_receipt' => $total_price,
-                ];
-                if($request->request_type == 'invoice') {
-                    switch ($request->lang)
-                    {
-                        case 'fa':
-                        default:
-                            return Response::success('مقدار تومان محاسبه گردید', $data, 200);
-                        case 'en':
-                            return Response::success('Toman amount calculated', $data, 200);
-                    }
+        $santizier = new Sanitizer($request->all(), [
+            'pair_type' => 'strip_tags',
+            'type' => 'strip_tags',
+            'pair_price' => 'strip_tags',
+            'pair_amount' => 'strip_tags',
+            'request_type' => 'strip_tags',
+            'receipt_type' => 'strip_tags'
+        ]);
+
+        $request_sanitized = $santizier->sanitize();
+
+        $validator = Validator::make($request_sanitized, [
+            'pair_type' => ['string'],
+            'type' => ['string'],
+            'pair_price' => ['numeric'],
+            'pair_amount' => ['numeric'],
+            'request_type' => ['string'],
+            'receipt_type' => ['string']
+        ]);
+
+        if ($validator->fails()) {
+            return Response::failed($validator->errors()->toArray(), null, 422, -1);
+        }
+
+        $tether_price = UsdtPrice::get()->quantity / 10;
+        $static_percent = \config('bitazar.coinex.wage_percent');
+
+        //      Market invoice or sell tether
+        if ($request->pair_type == 'USDT' || $request->pair_type == 'usdt') {
+            $total_price = $request->pair_amount * $tether_price;
+            $data = [
+                'your_payment' => $request->pair_amount,
+                'wage_percent' => 0,
+                'currency_type_wage_percent' => 'تومان',
+                'your_receipt' => $total_price,
+                'currency_type_your_receipt' => 'تومان',
+                'currency_type' => 'تتر',
+                'payment_type' => 'wallet'
+            ];
+            if($request->request_type == 'invoice') {
+
+                return Response::success(__('sell_exchange_success_toman_calculated'), $data, 200);
+
+            } elseif($request->request_type == 'sell'){
+
+                $usdt_freeze_amount = FreezeHelper::getFreezeAmount('USDT');
+
+                $user_wallet = $this->userWalletsRepository
+                    ->getUserWallet(Auth::guard('api')->id(), 'USDT');
+
+                if(($user_wallet->amount - $usdt_freeze_amount) < $request->pair_amount){
+                    $required_tether_amount  =  $request->pair_amount - ($user_wallet->amount - $usdt_freeze_amount);
+                    $data = [
+                        'required_tether_amount' => $required_tether_amount
+                    ];
+
+                    return Response::failed(__('trade_exchange_failed_tether_are_needed'), $data, 422, -1);
+
+
                 }
-                elseif($request->request_type == 'sell'){
-                    $user_wallet = $this->userWalletsRepository
-                        ->getUserWallet(Auth::guard('api')->id(), 'USDT');
+                else{
+                    $this->userWalletsRepository
+                        ->decreaseWalletAmount(Auth::guard('api')->id(), 'USDT', $request->pair_amount);
+                    $this->userWalletsRepository
+                        ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $total_price);
 
-                    if($user_wallet->amount < $request->pair_amount){
-                        $required_tether_amount  =  $request->pair_amount - $user_wallet->amount;
-                        $data = [
-                            'required_tether_amount' => $required_tether_amount
-                        ];
-                        switch ($request->lang)
-                        {
-                            case 'fa':
-                            default:
-                                return Response::failed('متاسفم، مقدار تتر بیشتری مورد نیاز است', $data, 422, -1);
-                            case 'en':
-                                return Response::failed('sorry, more tether are needed', $data, 422, -1);
-                        }
 
-                    }
-                    else{
-                        $this->userWalletsRepository
-                            ->decreaseWalletAmount(Auth::guard('api')->id(), 'USDT', $request->pair_amount);
-                        $this->userWalletsRepository
-                            ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $total_price);
+                    return Response::success(__('trade_exchange_success_toman_charged'), null, 200);
 
-                        switch ($request->lang)
-                        {
-                            case 'fa':
-                            default:
-                                return Response::success('تبریک، ولت تومانی شما شارژ شد', null, 200);
-                            case 'en':
-                                return Response::success('congratulation, your toman wallet has been charged', null, 200);
-                        }
 
-                    }
                 }
             }
-//          End market invoice or sell tether
+        }
+//      End market invoice or sell tether
 
-//          Market invoice or sell exchanges
-            $exchange_setting = ExchangeSetting::getExchangeSettings();
-            switch ($exchange_setting->exchange) {
-                case 'کوینکس':
-                default:
-                    // Get coinex market info for find sepcific currency and min amount and taker fee rate
-                    $coinex_market_info = CoinexMarketInfoExtracted::findMarketInfo(strtoupper($request->pair_type) . 'USDT');
-                    $coinex_market_info = json_decode($coinex_market_info->data);
-                    $min_amount = $coinex_market_info->min_amount;
-                    $maker_fee_rate = $coinex_market_info->maker_fee_rate;
+//      Market invoice or sell exchanges
+        $exchange_setting = ExchangeSetting::getExchangeSettings();
+        switch ($exchange_setting->exchange) {
+            case 'کوینکس':
+            default:
+                // Get coinex market info for find sepcific currency and min amount and taker fee rate
+                $coinex_market_info = CoinexMarketInfoExtracted::findMarketInfo(strtoupper($request->pair_type) . 'USDT');
+                $coinex_market_info = json_decode($coinex_market_info->data);
+                $min_amount = $coinex_market_info->min_amount;
+                $maker_fee_rate = \config('bitazar.coinex.network_wage_percent');
 
-                    // Find pair type in Currency model
-                    $currencies = Currency::getLastInfo();
-                    $data = json_decode($currencies->data);
-                    $invoice = [];
-                    foreach ($data->data->ticker as $exchange => $info) {
-                        if ($exchange == strtoupper($request->pair_type) . 'USDT') {
-                            $wage = SellExchangeTrait::calculateWage($request->pair_amount, $info->last, $static_percent);
-                            $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $info->last, $maker_fee_rate, $static_percent);
-                            $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tetherPrice);
-                            switch ($request->receipt_type) {
-                                case 'usdt':
-                                default:
-                                    $invoice = [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $total_tether,
-                                        'currency_type' => 'USDT'
-                                    ];
-                                    break;
-                                case 'toman':
-                                    $invoice = [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $toman_amount,
-                                        'currency_type' => 'IRR'
-                                    ];
-                                    break;
-                            }
-                        }
+                $pricing_decimal = $coinex_market_info->pricing_decimal;
+                $trading_decimal = $coinex_market_info->trading_decimal;
+
+                // Request to get ticker from coinex
+                $params = [
+                    'market' => strtoupper($request->pair_type) . 'USDT'
+                ];
+
+                $result = RequestHelper::send('https://api.coinex.com/v1/market/ticker', 'get', $params, null);
+
+                $info = (object) $result->data->ticker;
+
+                $invoice = [];
+
+                $wage = SellExchangeTrait::calculateWage($request->pair_amount, $info->last, $static_percent);
+                $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $info->last, $maker_fee_rate, $static_percent);
+                $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tether_price);
+                $maker_fee_rate = SellExchangeTrait::calculateNetworkWage($request->pair_amount, $maker_fee_rate, $info->last);
+
+                switch ($request->receipt_type) {
+                    case 'usdt':
+                    default:
+                        $invoice = [
+                            'your_payment' => $request->pair_amount,
+                            'wage_percent' => $wage,
+                            'network_wage' => $maker_fee_rate,
+                            'currency_type_wage_percent' => 'تتر',
+                            'your_receipt' => $total_tether,
+                            'currency_type_your_receipt' => 'تتر',
+                            'currency_type' => strtoupper($request->pair_type),
+                            'payment_type' => 'wallet'
+                        ];
+                        break;
+                    case 'toman':
+                        $invoice = [
+                            'your_payment' => $request->pair_amount,
+                            'wage_percent' => $wage * $tether_price,
+                            'network_wage' => $maker_fee_rate * $tether_price,
+                            'currency_type_wage_percent' => 'تومان',
+                            'your_receipt' => $toman_amount,
+                            'currency_type_your_receipt' => 'تومان',
+                            'currency_type' => strtoupper($request->pair_type),
+                            'payment_type' => 'wallet'
+                        ];
+                        break;
+                }
+
+
+                if ($request->request_type == 'invoice') {
+
+
+                    return Response::success(__('trade_exchange_success_your_exchange_calculated'), $invoice, 200);
+
+                } elseif ($request->request_type == 'sell') {
+
+                    // Check user amount with minimum amount of order
+                    if ($request->pair_amount < $min_amount) {
+                        $data = [
+                            'min_required_pair_amount' => $min_amount,
+                            'your_pair_amount' => $request->pair_amount,
+                            'difference_in_min_amount' => $min_amount - $request->pair_amount
+                        ];
+
+                        return Response::failed(__('trade_exchange_failed_minimum_order'), $data, 200, -4);
+
                     }
-                    if ($request->request_type == 'invoice') {
 
-                        switch ($request->lang) {
-                            case 'fa':
-                            default:
-                                return Response::success('ارز مورد نظر محاسبه گردید', $invoice, 200);
-                            case 'en':
-                                return Response::success('Your exchange info calculated', $invoice, 200);
-                        }
+                    $pair_freeze_amount = FreezeHelper::getFreezeAmount(strtoupper($request->pair_type));
 
-                    } elseif ($request->request_type == 'sell') {
+                    // Get user wallet (that's have currency)
+                    $user_wallet = $this->userWalletsRepository
+                        ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
 
-                        // Check user amount with minimum amount of order
-                        if ($request->pair_amount < $min_amount) {
-                            $data = [
-                                'min_required_pair_amount' => $min_amount,
-                                'your_pair_amount' => $request->pair_amount,
-                                'difference_in_min_amount' => $min_amount - $request->pair_amount
+                    // Check amount of wallet
+                    if (($user_wallet->amount - $pair_freeze_amount) < $request->pair_amount) {
+
+                        $required_exchange_amount = $request->pair_amount - ($user_wallet->amount - $pair_freeze_amount);
+                        $data = [
+                            'required_exchange_amount' => $required_exchange_amount
+                        ];
+
+                        return Response::failed(__('sell_exchange_failed_more_currency_needed'), $data, 422, -2);
+
+
+                    } else {
+
+                        $order_setting = OrderSetting::checkOrderMode();
+                        $coinex_order_result = 0;
+                        if ($order_setting->mode == OrderSetting::AUTOMATIC_MODE) {
+
+                            // Prepare send request to coinex
+                            $coinex_order_info = [
+                                'access_id' => config('bitazar.coinex.access_id'),
+                                'market' => strtoupper($request->pair_type) . 'USDT',
+                                'type' => 'sell',
+                                'amount' => number_format($request->pair_amount, $trading_decimal),
+                                'tonce' => now()->toDateTimeString(),
+                                'account_id' => 0,
+                                'client_id' => Auth::guard('api')->user()->mobile
                             ];
-                            switch ($request->lang) {
-                                case 'fa':
-                                default:
-                                    return Response::failed('حداقل سفارش در ارز مورد نظر بیشتر می باشد', $data, 200, -4);
-                                case 'en':
-                                    return Response::failed('The minimum order is higher in the order currency', $data, 200, -4);
-                            }
-                        }
 
-                        // Get user wallet (that's have currency)
-                        $user_wallet = $this->userWalletsRepository
-                            ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
-
-                        // Check amount of wallet
-                        if ($user_wallet->amount < $request->pair_amount) {
-
-                            $required_exchange_amount = $request->pair_amount - $user_wallet->amount;
-                            $data = [
-                                'required_exchange_amount' => $required_exchange_amount
-                            ];
-                            switch ($request->lang) {
-                                case 'fa':
-                                default:
-                                    return Response::failed('متاسفم، مقدار ارز بیشتری مورد نیاز است', $data, 422, -2);
-                                case 'en':
-                                    return Response::failed('sorry, more ' . strtolower($request->pair_type) . ' are needed', $data, 422, -2);
-                            }
+                            // Send request to coinex
+                            $coinex_order_result = SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'market');
 
                         } else {
+
+                            $order_info = [
+                                'user_id' => Auth::guard('api')->id(),
+                                'time' => now(),
+                                'market' => strtoupper($request->pair_type) . 'USDT',
+                                'type' => OrdersList::MARKET_TYPE,
+                                'role' => OrdersList::SELL_ROLE,
+                                'order_price' => $toman_amount,
+                                'avg_price' => 0,
+                                'amount' => $request->pair_amount,
+                                'total_price' => $total_tether,
+                                'current_wage' => $wage,
+                                'toman_wage' => $tether_price * $wage,
+                                'filled' => 0,
+                                'status' => OrdersList::PENDING_STATUS,
+                            ];
+                            OrderRepository::storeSellOrders($order_info);
+                        }
+
+                        if (!@$coinex_order_result->code) {
 
                             $this->userWalletsRepository
                                 ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
@@ -202,353 +279,202 @@ class SellExchangeController extends Controller
                                     break;
                             }
 
-                            $order_setting = OrderSetting::checkOrderMode();
-                            $automatic_mode = 'اتوماتیک';
-                            $coinex_order_result = 0;
-                            if ($order_setting->mode == $automatic_mode) {
+                            $order_info = [
+                                'user_id' => Auth::guard('api')->id(),
+                                'time' => now(),
+                                'market' => strtoupper($request->pair_type) . 'USDT',
+                                'type' => OrdersList::MARKET_TYPE,
+                                'role' => OrdersList::SELL_ROLE,
+                                'order_price' => $toman_amount,
+                                'avg_price' => 0,
+                                'amount' => $request->pair_amount,
+                                'total_price' => $total_tether,
+                                'current_wage' => $wage,
+                                'toman_wage' => $tether_price * $wage,
+                                'filled' => 100,
+                                'status' => OrdersList::DONE_STATUS,
+                            ];
+                            $order_info = OrderRepository::storeSellOrders($order_info);
 
-                                // Prepare send request to coinex
-                                $coinex_order_info = [
-                                    'access_id' => '1',
-                                    'market' => strtoupper($request->pair_type) . 'USDT',
-                                    'type' => 'buy',
-                                    'amount' => $request->pair_amount,
-                                    'tonce' => now()->toDateTimeString(),
-                                    'account_id' => 0,
-                                    'client_id' => Auth::guard('api')->user()->mobile
-                                ];
+                            // Prepare coinex done order information (order_id is foreign key on orders_list table)
+                            $done_order_info = [
+                                'order_id' => $order_info->id,
+                                'amount' => @$coinex_order_result->amount,
+                                'asset_fee' => @$coinex_order_result->asset_fee,
+                                'avg_price' => @$coinex_order_result->avg_price,
+                                'client_id' => @$coinex_order_result->client_id,
+                                'create_time' => @$coinex_order_result->create_time,
+                                'deal_amount' => @$coinex_order_result->deal_amount,
+                                'deal_fee' => @$coinex_order_result->deal_fee,
+                                'deal_money' => @$coinex_order_result->deal_money,
+                                'fee_asset' => @$coinex_order_result->fee_asset,
+                                'fee_discount' => @$coinex_order_result->fee_discount,
+                                'finished_time' => @$coinex_order_result->finished_time,
+                                'identifier' => @$coinex_order_result->id,
+                                'left' => @$coinex_order_result->left,
+                                'maker_fee_rate' => @$coinex_order_result->maker_fee_rate,
+                                'market' => @$coinex_order_result->market,
+                                'money_fee' => @$coinex_order_result->money_fee,
+                                'order_type' => @$coinex_order_result->order_type,
+                                'price' => @$coinex_order_result->price,
+                                'status' => @$coinex_order_result->status,
+                                'stock_fee' => @$coinex_order_result->stock_fee,
+                                'taker_fee_rate' => @$coinex_order_result->taker_fee_rate,
+                                'type' => @$coinex_order_result->type
+                            ];
 
-                                // Send request to coinex
-                                $coinex_order_result = SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
+                            // Store done order
+                            DoneOrdersList::store($done_order_info);
 
-                            } else {
-                                
-                                $order_info = [
-                                    'user_id' => Auth::guard('api')->id(),
-                                    'time' => now(),
-                                    'market' => strtoupper($request->pair_type) . 'USDT',
-                                    'type' => OrdersList::MARKET_TYPE,
-                                    'role' => OrdersList::SELL_ROLE,
-                                    'order_price' => $toman_amount,
-                                    'avg_price' => 0,
-                                    'amount' => $request->pair_amount,
-                                    'total_price' => $total_tether,
-                                    'current_wage' => $wage,
-                                    'filled' => 0,
-                                    'status' => OrdersList::PENDING_STATUS,
-                                ];
-                                OrderRepository::storeSellOrders($order_info);
-                            }
+                            // Store daily income
+                            $quantity = $tether_price * $wage;
+                            Income::store($quantity);
 
-                            if ($coinex_order_result == 0) {
-                                // Store real order
+                            $income_log = [
+                                'user_id' => Auth::guard('api')->id(),
+                                'order_id' => $order_info->id,
+                                'wage' => $quantity,
+                                'type' => OrdersList::SELL_ROLE,
+                            ];
+                            IncomeLog::store($income_log);
 
-                                // Store order done
-                                $order_info = [
-                                    'user_id' => Auth::guard('api')->id(),
-                                    'time' => now(),
-                                    'market' => strtoupper($request->pair_type) . 'USDT',
-                                    'type' => OrdersList::MARKET_TYPE,
-                                    'role' => OrdersList::SELL_ROLE,
-                                    'order_price' => $toman_amount,
-                                    'avg_price' => 0,
-                                    'amount' => $request->pair_amount,
-                                    'total_price' => $total_tether,
-                                    'current_wage' => $wage,
-                                    'filled' => 0,
-                                    'status' => OrdersList::DONE_STATUS,
-                                ];
-                                OrderRepository::storeSellOrders($order_info);
+                            //event(new OrderVolumenScore(Auth::guard('api')->user()));
 
-                                // Send message of user order
-                                SmsHelper::sendMessage(Auth::guard('api')->user()->mobile, $this->templates_id['sell_market_order'], $request->pair_amount);
+                            $currency = ExchangeList::findBySymbol(strtoupper($request->pair_type));
+                            event(new pay_commision(Auth::guard('api')->user(), $wage, $currency->id));
 
-                                switch ($request->lang) {
-                                    case 'fa':
-                                    default:
-                                        return Response::success('تبریک، ولت شما با موفقیت شارژ شد', null, 200);
-                                    case 'en':
-                                        return Response::success('congratulation, your ' . strtolower($request->pair_type) . ' wallet has been charged', null, 200);
-                                }
-
-                            } else {
-
-                                $order_log = [
-                                    'user_id' => Auth::guard('api')->id(),
-                                    'market' => strtoupper($request->pair_type) . 'USDT',
-                                    'type' => OrdersList::MARKET_TYPE,
-                                    'role' => OrdersList::SELL_ROLE,
-                                    'order_price' => $toman_amount,
-                                    'avg_price' => 0,
-                                    'amount' => $request->pair_amount,
-                                    'total_price' => $total_tether,
-                                    'current_wage' => $wage,
-                                    'filled' => 0,
-                                    'status' => OrdersList::CANCEL_STATUS,
-                                    'exchange_error' => $coinex_order_result['error']
-                                ];
-
-                                OrdersLog::storeLog($order_log);
-
-                                return Response::failed($coinex_order_result['error'], null, 400, '-'.$coinex_order_result['code']);
-                            }
+                            // Send message of user order
+                            SmsHelper::sendMessage(Auth::guard('api')->user()->mobile, $this->templates_id['sell_market_order'], [$request->pair_amount, $request->pair_type]);
 
 
+                            return Response::success(__('sell_exchange_success_sold'), null, 200);
+
+
+                        } else {
+
+                            $order_log = [
+                                'user_id' => Auth::guard('api')->id(),
+                                'market' => strtoupper($request->pair_type) . 'USDT',
+                                'type' => OrdersList::MARKET_TYPE,
+                                'role' => OrdersList::SELL_ROLE,
+                                'order_price' => $toman_amount,
+                                'avg_price' => 0,
+                                'amount' => $request->pair_amount,
+                                'total_price' => $total_tether,
+                                'current_wage' => $wage,
+                                'toman_wage' => $tether_price * $wage,
+                                'filled' => 0,
+                                'status' => OrdersList::CANCEL_STATUS,
+                                'request_values' => json_encode($coinex_order_info),
+                                'exchange_error' => $coinex_order_result->error
+                            ];
+
+                            OrdersLog::storeLog($order_log);
+
+                            SmsHelper::sendMessage('09122335645', $this->templates_id['coinex_error'], [Auth::guard('api')->user()->mobile . '' . OrdersList::MARKET_TYPE ,$coinex_order_result->error]);
+
+                            return Response::failed(__('trade_exchange_failed_problem_about_operation'), null, 400, -3);
                         }
+
 
                     }
 
-
-                    break;
-
-                case 'کوکوین':
-                    $market_info = KucoinCurrency::getLastInfo();
-                    $data = json_decode($market_info->data);
-                    foreach ($data->data->ticker as $market_info) {
-                        if ($market_info->symbol == strtoupper($request->pair_type) . '-USDT') {
-                            $maker_fee_rate = $market_info->makerFeeRate;
-                            $invoice = [];
-                            $wage = SellExchangeTrait::calculateWage($request->pair_amount, $market_info->last, $static_percent);
-                            $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $market_info->last, $maker_fee_rate, $static_percent);
-                            $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tetherPrice);
-                            switch ($request->receipt_type) {
-                                case 'usdt':
-                                default:
-                                    $invoice = [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $total_tether,
-                                        'currency_type' => 'USDT'
-                                    ];
-                                    break;
-                                case 'toman':
-                                    $invoice = [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $toman_amount,
-                                        'currency_type' => 'IRR'
-                                    ];
-                                    break;
-                            }
-
-                            if ($request->request_type == 'invoice') {
-                                switch ($request->lang) {
-                                    case 'fa':
-                                    default:
-                                        return Response::success('ارز مورد نظر محاسبه گردید', $invoice, 200);
-                                    case 'en':
-                                        return Response::success('Your exchange info calculated', $invoice, 200);
-                                }
-                            } elseif ($request->request_type == 'sell') {
-
-                                $user_wallet = $this->userWalletsRepository
-                                    ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
-
-                                if ($user_wallet->amount < $request->pair_amount) {
-                                    $required_exchange_amount = $request->pair_amount - $user_wallet->amount;
-                                    $data = [
-                                        'required_exchange_amount' => $required_exchange_amount
-                                    ];
-
-                                    switch ($request->lang) {
-                                        case 'fa':
-                                        default:
-                                            return Response::failed('متاسفم، مقدار ارز بیشتری مورد نیاز است', $data, 422, -2);
-                                        case 'en':
-                                            return Response::failed('sorry, more ' . strtolower($request->pair_type) . ' are needed', $data, 422, -2);
-                                    }
-
-                                } else {
-                                    $this->userWalletsRepository
-                                        ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
-
-                                    switch ($request->receipt_type) {
-                                        case 'usdt':
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
-                                            break;
-                                        case 'toman':
-                                        default:
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
-                                            break;
-                                    }
+                }
 
 
-                                    $order_setting = OrderSetting::checkOrderMode();
-                                    $coinex_order_result = 0;
-                                    if ($order_setting->mode == 'اتوماتیک') {
-                                        $coinex_order_info = [
-                                            'access_id' => '1',
-                                            'market' => strtoupper($request->pair_type) . 'USDT',
-                                            'type' => 'sell',
-                                            'amount' => $request->pair_amount,
-                                            'tonce' => now()->toDateTimeString(),
-                                            'account_id' => 0,
-                                            'client_id' => Auth::guard('api')->user()->mobile
-                                        ];
+                break;
 
-                                        $coinex_order_result = SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
-                                    }
+            case 'کوکوین':
+                $market_info = KucoinCurrency::getLastInfo();
+                $data = json_decode($market_info->data);
+                foreach ($data->data->ticker as $market_info) {
+                    if ($market_info->symbol == strtoupper($request->pair_type) . '-USDT') {
+                        $maker_fee_rate = $market_info->makerFeeRate;
+                        $invoice = [];
+                        $wage = SellExchangeTrait::calculateWage($request->pair_amount, $market_info->last, $static_percent);
+                        $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $market_info->last, $maker_fee_rate, $static_percent);
+                        $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tether_price);
 
-                                    if ($coinex_order_result == 0) {
+                        $pricing_decimal = $coinex_market_info->pricing_decimal;
+                        $trading_decimal = $coinex_market_info->trading_decimal;
 
-                                        $order_info = [
-                                            'user_id' => Auth::guard('api')->id(),
-                                            'time' => now(),
-                                            'market' => strtoupper($request->pair_type) . 'USDT',
-                                            'type' => OrdersList::MARKET_TYPE,
-                                            'role' => OrdersList::SELL_ROLE,
-                                            'order_price' => $toman_amount,
-                                            'avg_price' => 0,
-                                            'amount' => $request->pair_amount,
-                                            'total_price' => $total_tether,
-                                            'current_wage' => $wage,
-                                            'filled' => 0,
-                                            'status' => OrdersList::DONE_STATUS,
-                                        ];
-
-                                        $order_info = OrderRepository::storeBuyOrders($order_info);
-
-
-                                        // Prepare coinex done order information (order_id is foreign key on orders_list table)
-                                        $done_order_info = [
-                                            'order_id' => $order_info->id,
-                                            'amount' => @$coinex_order_result['amount'],
-                                            'asset_fee' => @$coinex_order_result['asset_fee'],
-                                            'avg_price' => @$coinex_order_result['avg_price'],
-                                            'client_id' => @$coinex_order_result['client_id'],
-                                            'create_time' => @$coinex_order_result['create_time'],
-                                            'deal_amount' => @$coinex_order_result['deal_amount'],
-                                            'deal_fee' => @$coinex_order_result['deal_fee'],
-                                            'deal_money' => @$coinex_order_result['deal_money'],
-                                            'fee_asset' => @$coinex_order_result['fee_asset'],
-                                            'fee_discount' => @$coinex_order_result['fee_discount'],
-                                            'finished_time' => @$coinex_order_result['finished_time'],
-                                            'id' => @$coinex_order_result['id'],
-                                            'left' => @$coinex_order_result['left'],
-                                            'maker_fee_rate' => @$coinex_order_result['maker_fee_rate'],
-                                            'market' => @$coinex_order_result['market'],
-                                            'money_fee' => @$coinex_order_result['money_fee'],
-                                            'order_type' => @$coinex_order_result['order_type'],
-                                            'price' => @$coinex_order_result['price'],
-                                            'status' => @$coinex_order_result['status'],
-                                            'stock_fee' => @$coinex_order_result['stock_fee'],
-                                            'taker_fee_rate' => @$coinex_order_result['taker_fee_rate'],
-                                            'type' => @$coinex_order_result['type']
-                                        ];
-
-                                        // Store done order
-                                        DoneOrdersList::store($done_order_info);
-
-                                        // Send message of user order
-                                        SmsHelper::sendMessage(Auth::guard('api')->user()->mobile, $this->templates_id['market_order'], $request->pair_amount);
-
-                                        switch ($request->lang) {
-                                            case 'fa':
-                                            default:
-                                                return Response::success('تبریک، ولت شما با موفقیت شارژ شد', null, 200);
-                                            case 'en':
-                                                return Response::success('congratulation, your ' . strtolower($request->pair_type) . ' wallet has been charged', null, 200);
-                                        }
-                                    } else {
-
-                                        $order_log = [
-                                            'user_id' => Auth::guard('api')->id(),
-                                            'market' => strtoupper($request->pair_type) . 'USDT',
-                                            'type' => OrdersList::MARKET_TYPE,
-                                            'role' => OrdersList::BUY_ROLE,
-                                            'order_price' => $total_tether,
-                                            'avg_price' => 0,
-                                            'amount' => $request->pair_amount,
-                                            'total_price' => $toman_amount,
-                                            'current_wage' => $wage,
-                                            'filled' => 0,
-                                            'status' => OrdersList::CANCEL_STATUS,
-                                            'exchange_error' => $coinex_order_result['error']
-                                        ];
-
-                                        OrdersLog::storeLog($order_log);
-
-                                        return Response::failed($coinex_order_result['error'], null, 400, '-'.$coinex_order_result['code']);
-                                    }
-                                    // End user buy currenct with usdt
-
-
-                                }
-                            }
+                        switch ($request->receipt_type) {
+                            case 'usdt':
+                            default:
+                                $invoice = [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $total_tether,
+                                    'currency_type_your_receipt' => 'تتر',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                            case 'toman':
+                                $invoice = [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $toman_amount,
+                                    'currency_type_your_receipt' => 'تومان',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
                         }
-                    }
-                    break;
 
-                case 'بایننس':
-                    $market_info = BinanceCurrency::getLastInfo();
-                    $data = json_decode($market_info->data);
-                    foreach ($data as $market_info) {
-                        if ($market_info->symbol == strtoupper($request->pair_type) . 'USDT') {
-                            $maker_fee_rate = ($request->pair_amount * $market_info->price) * 0.1;
-                            $invoice = [];
-                            $wage = SellExchangeTrait::calculateWage($request->pair_amount, $market_info->price, $static_percent);
-                            $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $market_info->price, $maker_fee_rate, $static_percent);
-                            $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tetherPrice);
-                            switch ($request->receipt_type) {
-                                case 'usdt':
-                                default:
-                                    $invoice = [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $total_tether,
-                                        'currency_type' => 'USDT'
-                                    ];
-                                    break;
-                                case 'toman':
-                                    $invoice = [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $toman_amount,
-                                        'currency_type' => 'IRR'
-                                    ];
-                                    break;
-                            }
+                        if ($request->request_type == 'invoice') {
 
-                            if ($request->request_type == 'invoice') {
-                                switch ($request->lang) {
-                                    case 'fa':
+                            return Response::success(__('trade_exchange_success_your_exchange_calculated'), $invoice, 200);
+
+                        } elseif ($request->request_type == 'sell') {
+
+                            $user_wallet = $this->userWalletsRepository
+                                ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
+
+                            if ($user_wallet->amount < $request->pair_amount) {
+                                $required_exchange_amount = $request->pair_amount - $user_wallet->amount;
+                                $data = [
+                                    'required_exchange_amount' => $required_exchange_amount
+                                ];
+
+
+                                return Response::failed(__('sell_exchange_failed_more_currency_needed'), $data, 422, -2);
+
+
+                            } else {
+                                $this->userWalletsRepository
+                                    ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
+
+                                switch ($request->receipt_type) {
+                                    case 'usdt':
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
+                                        break;
+                                    case 'toman':
                                     default:
-                                        return Response::success('ارز مورد نظر محاسبه گردید', $invoice, 200);
-                                    case 'en':
-                                        return Response::success('Your exchange info calculated', $invoice, 200);
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
+                                        break;
                                 }
-                            } elseif ($request->request_type == 'sell') {
-                                $user_wallet = $this->userWalletsRepository
-                                    ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
-                                if ($user_wallet->amount < $request->pair_amount) {
-                                    $required_exchange_amount = $request->pair_amount - $user_wallet->amount;
-                                    $data = [
-                                        'required_exchange_amount' => $required_exchange_amount
-                                    ];
-                                    switch ($request->lang) {
-                                        case 'fa':
-                                        default:
-                                            return Response::failed('متاسفم، مقدار ارز بیشتری مورد نیاز است', $data, 422, -2);
-                                        case 'en':
-                                            return Response::failed('sorry, more ' . strtolower($request->pair_type) . ' are needed', $data, 422, -2);
-                                    }
-                                } else {
-                                    $this->userWalletsRepository
-                                        ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
 
-                                    switch ($request->receipt_type) {
-                                        case 'usdt':
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
-                                            break;
-                                        case 'toman':
-                                        default:
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
-                                            break;
-                                    }
+
+                                $order_setting = OrderSetting::checkOrderMode();
+                                $coinex_order_result = 0;
+                                if ($order_setting->mode == OrderSetting::AUTOMATIC_MODE) {
+                                    $coinex_order_info = [
+                                        'access_id' => config('bitazar.coinex.access_id'),
+                                        'market' => strtoupper($request->pair_type) . 'USDT',
+                                        'type' => 'sell',
+                                        'amount' => number_format($request->pair_amount, $trading_decimal),
+                                        'tonce' => now()->toDateTimeString(),
+                                        'account_id' => 0,
+                                        'client_id' => Auth::guard('api')->user()->mobile
+                                    ];
+
+                                    $coinex_order_result = SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'market');
+                                }
+
+                                if ($coinex_order_result == 0) {
 
                                     $order_info = [
                                         'user_id' => Auth::guard('api')->id(),
@@ -561,511 +487,714 @@ class SellExchangeController extends Controller
                                         'amount' => $request->pair_amount,
                                         'total_price' => $total_tether,
                                         'current_wage' => $wage,
-                                        'filled' => 0,
-                                        'status' => OrdersList::PENDING_STATUS,
+                                        'toman_wage' => $tether_price * $wage,
+                                        'filled' => 100,
+                                        'status' => OrdersList::DONE_STATUS,
                                     ];
 
-                                    OrderRepository::storeBuyOrders($order_info);
+                                    $order_info = OrderRepository::storeBuyOrders($order_info);
 
-                                    $order_setting = OrderSetting::checkOrderMode();
-                                    if ($order_setting->mode == 'اتوماتیک') {
-                                        $coinex_order_info = [
-                                            'access_id' => '1',
-                                            'market' => strtoupper($request->pair_type) . 'USDT',
-                                            'type' => 'buy',
-                                            'amount' => $request->pair_amount,
-                                            'tonce' => now()->toDateTimeString(),
-                                            'account_id' => 0,
-                                            'client_id' => Auth::guard('api')->user()->mobile
-                                        ];
 
-                                        SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
-                                    }
+                                    // Prepare coinex done order information (order_id is foreign key on orders_list table)
+                                    $done_order_info = [
+                                        'order_id' => $order_info->id,
+                                        'amount' => @$coinex_order_result->amount,
+                                        'asset_fee' => @$coinex_order_result->asset_fee,
+                                        'avg_price' => @$coinex_order_result->avg_price,
+                                        'client_id' => @$coinex_order_result->client_id,
+                                        'create_time' => @$coinex_order_result->create_time,
+                                        'deal_amount' => @$coinex_order_result->deal_amount,
+                                        'deal_fee' => @$coinex_order_result->deal_fee,
+                                        'deal_money' => @$coinex_order_result->deal_money,
+                                        'fee_asset' => @$coinex_order_result->fee_asset,
+                                        'fee_discount' => @$coinex_order_result->fee_discount,
+                                        'finished_time' => @$coinex_order_result->finished_time,
+                                        'id' => @$coinex_order_result->id,
+                                        'left' => @$coinex_order_result->left,
+                                        'maker_fee_rate' => @$coinex_order_result->maker_fee_rate,
+                                        'market' => @$coinex_order_result->market,
+                                        'money_fee' => @$coinex_order_result->money_fee,
+                                        'order_type' => @$coinex_order_result->order_type,
+                                        'price' => @$coinex_order_result->price,
+                                        'status' => @$coinex_order_result->status,
+                                        'stock_fee' => @$coinex_order_result->stock_fee,
+                                        'taker_fee_rate' => @$coinex_order_result->taker_fee_rate,
+                                        'type' => @$coinex_order_result->type
+                                    ];
 
-                                    switch ($request->lang) {
-                                        case 'fa':
-                                        default:
-                                            return Response::success('تبریک، ولت شما با موفقیت شارژ شد', null, 200);
-                                        case 'en':
-                                            return Response::success('congratulation, your ' . strtolower($request->receipt_type) . ' wallet has been charged', null, 200);
-                                    }
+                                    // Store done order
+                                    DoneOrdersList::store($done_order_info);
 
+                                    //event(new OrderVolumenScore(Auth::guard('api')->user()));
+
+                                    $currency = ExchangeList::findBySymbol(strtoupper($request->pair_type));
+                                    event(new pay_commision(Auth::guard('api')->user(), $wage, $currency->id));
+
+                                    // Send message of user order
+                                    SmsHelper::sendMessage(Auth::guard('api')->user()->mobile, $this->templates_id['sell_limit_order'], [$request->pair_amount, $request->pair_type]);
+
+
+                                    return Response::success(__('trade_exchange_success_wallet'), null, 200);
+
+                                } else {
+
+                                    $order_log = [
+                                        'user_id' => Auth::guard('api')->id(),
+                                        'market' => strtoupper($request->pair_type) . 'USDT',
+                                        'type' => OrdersList::MARKET_TYPE,
+                                        'role' => OrdersList::BUY_ROLE,
+                                        'order_price' => $total_tether,
+                                        'avg_price' => 0,
+                                        'amount' => $request->pair_amount,
+                                        'total_price' => $toman_amount,
+                                        'current_wage' => $wage,
+                                        'toman_wage' => $tether_price * $wage,
+                                        'filled' => 0,
+                                        'status' => OrdersList::CANCEL_STATUS,
+                                        'exchange_error' => $coinex_order_result->error
+                                    ];
+
+                                    OrdersLog::storeLog($order_log);
+
+                                    SmsHelper::sendMessage('09122335645', $this->templates_id['coinex_error'], [Auth::guard('api')->user()->mobile . '' . OrdersList::MARKET_TYPE ,$coinex_order_result->error]);
+
+                                    return Response::failed(__('trade_exchange_failed_problem_about_operation'), null, 400, -3);
                                 }
+                                // End user buy currenct with usdt
+
+
                             }
                         }
                     }
-                    break;
+                }
+                break;
 
-            }
-//          end market invoice or sell exchanges
-        }
+            case 'بایننس':
+                $market_info = BinanceCurrency::getLastInfo();
+                $data = json_decode($market_info->data);
+                foreach ($data as $market_info) {
+                    if ($market_info->symbol == strtoupper($request->pair_type) . 'USDT') {
+                        $maker_fee_rate = ($request->pair_amount * $market_info->price) * 0.1;
+                        $invoice = [];
+                        $wage = SellExchangeTrait::calculateWage($request->pair_amount, $market_info->price, $static_percent);
+                        $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $market_info->price, $maker_fee_rate, $static_percent);
+                        $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tether_price);
 
-        if ($request->type == 'limit' && $request->has('pair_price')){
-//          Limit invoice or buy tether
-            if ($request->pair_type == 'USDT' || $request->pair_type == 'usdt') {
-                $total_price = $request->pair_amount * $request->pair_price;
-                $data = [
-                    'your_payment' => $request->pair_amount,
-                    'wage_percent' => 0,
-                    'your_receipt' => $total_price
-                ];
-                if($request->request_type == 'invoice') {
-                    switch ($request->lang)
-                    {
-                        case 'fa':
-                        default:
-                            return Response::success('مقدار تتر محاسبه گردید', $data, 200);
-                        case 'en':
-                            return Response::success('Tether amount calculated', $data, 200);
+                        $pricing_decimal = $coinex_market_info->pricing_decimal;
+                        $trading_decimal = $coinex_market_info->trading_decimal;
+
+                        switch ($request->receipt_type) {
+                            case 'usdt':
+                            default:
+                                $invoice = [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $total_tether,
+                                    'currency_type_your_receipt' => 'تتر',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                            case 'toman':
+                                $invoice = [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $toman_amount,
+                                    'currency_type_your_receipt' => 'تتر',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                        }
+
+                        if ($request->request_type == 'invoice') {
+
+                            return Response::success(__('trade_exchange_success_your_exchange_calculated'), $invoice, 200);
+
+                        } elseif ($request->request_type == 'sell') {
+                            $user_wallet = $this->userWalletsRepository
+                                ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
+                            if ($user_wallet->amount < $request->pair_amount) {
+                                $required_exchange_amount = $request->pair_amount - $user_wallet->amount;
+                                $data = [
+                                    'required_exchange_amount' => $required_exchange_amount
+                                ];
+
+                                return Response::failed(__('sell_exchange_failed_more_currency_needed'), $data, 422, -2);
+
+                            } else {
+                                $this->userWalletsRepository
+                                    ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
+
+                                switch ($request->receipt_type) {
+                                    case 'usdt':
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
+                                        break;
+                                    case 'toman':
+                                    default:
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
+                                        break;
+                                }
+
+                                $order_info = [
+                                    'user_id' => Auth::guard('api')->id(),
+                                    'time' => now(),
+                                    'market' => strtoupper($request->pair_type) . 'USDT',
+                                    'type' => OrdersList::MARKET_TYPE,
+                                    'role' => OrdersList::SELL_ROLE,
+                                    'order_price' => $toman_amount,
+                                    'avg_price' => 0,
+                                    'amount' => $request->pair_amount,
+                                    'total_price' => $total_tether,
+                                    'current_wage' => $wage,
+                                    'toman_wage' => $tether_price * $wage,
+                                    'filled' => 0,
+                                    'status' => OrdersList::PENDING_STATUS,
+                                ];
+
+                                OrderRepository::storeBuyOrders($order_info);
+
+                                $order_setting = OrderSetting::checkOrderMode();
+                                if ($order_setting->mode == OrderSetting::AUTOMATIC_MODE) {
+                                    $coinex_order_info = [
+                                        'access_id' => config('bitazar.coinex.access_id'),
+                                        'market' => strtoupper($request->pair_type) . 'USDT',
+                                        'type' => 'buy',
+                                        'amount' => $request->pair_amount,
+                                        'tonce' => now()->toDateTimeString(),
+                                        'account_id' => 0,
+                                        'client_id' => Auth::guard('api')->user()->mobile
+                                    ];
+
+                                    SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'market');
+                                }
+
+
+                                return Response::success(__('sell_exchange_success_sold'), null, 200);
+
+
+                            }
+                        }
                     }
                 }
-                elseif($request->request_type == 'sell'){
-                    $user_wallet = $this->userWalletsRepository
-                        ->getUserWallet(Auth::guard('api')->id(), 'USDT');
+                break;
 
-                    if($user_wallet->amount < $request->pair_amount){
-                        $required_tether_amount  =  $request->pair_amount - $user_wallet->amount;
-                        $data = [
-                            'required_tether_amount' => $required_tether_amount
+        }
+//      end market invoice or sell exchanges
+
+    }
+
+    public function limit(Request $request)
+    {
+
+        $santizier = new Sanitizer($request->all(), [
+            'pair_type' => 'strip_tags',
+            'type' => 'strip_tags',
+            'pair_price' => 'strip_tags',
+            'pair_amount' => 'strip_tags',
+            'request_type' => 'strip_tags',
+            'receipt_type' => 'strip_tags'
+        ]);
+
+        $request_sanitized = $santizier->sanitize();
+
+        $validator = Validator::make($request_sanitized, [
+            'pair_type' => ['string'],
+            'type' => ['string'],
+            'pair_price' => ['numeric'],
+            'pair_amount' => ['numeric'],
+            'request_type' => ['string'],
+            'receipt_type' => ['string']
+        ]);
+
+        if ($validator->fails()) {
+            return Response::failed($validator->errors()->toArray(), null, 422, -1);
+        }
+
+        $tether_price = UsdtPrice::get()->quantity / 10;
+        $static_percent = \config('bitazar.coinex.wage_percent');
+
+//      Limit invoice or sell tether
+        if ($request->pair_type == 'USDT' || $request->pair_type == 'usdt') {
+            $total_price = $request->pair_amount * $request->pair_price;
+            $data = [
+                'your_payment' => $request->pair_amount,
+                'wage_percent' => 0,
+                'currency_type_wage_percent' => 'تومان',
+                'your_receipt' => $total_price,
+                'currency_type_your_receipt' => 'تومان',
+                'currency_type' => 'تتر'
+            ];
+            if($request->request_type == 'invoice') {
+
+                return Response::success(__('trade_exchange_success_tether_amount_calculated'), $data, 200);
+
+            } elseif($request->request_type == 'sell'){
+
+                $usdt_freeze_amount = FreezeHelper::getFreezeAmount('USDT');
+
+                $user_wallet = $this->userWalletsRepository
+                    ->getUserWallet(Auth::guard('api')->id(), 'USDT');
+
+                if(($user_wallet->amount - $usdt_freeze_amount) < $request->pair_amount){
+                    $required_tether_amount  =  $request->pair_amount - ($user_wallet->amount - $usdt_freeze_amount);
+                    $data = [
+                        'required_tether_amount' => $required_tether_amount
+                    ];
+
+                    return Response::failed(__('trade_exchange_failed_tether_are_needed'), $data, 422, -1);
+
+
+                }
+                else{
+                    $this->userWalletsRepository
+                        ->decreaseWalletAmount(Auth::guard('api')->id(), 'USDT', $request->pair_amount);
+                    $this->userWalletsRepository
+                        ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $total_price);
+
+                    $order_info = [
+                        'user_id' => Auth::guard('api')->id(),
+                        'time' => now(),
+                        'market' => 'USDT',
+                        'type' => OrdersList::LIMIT_TYPE,
+                        'role' => OrdersList::SELL_ROLE,
+                        'order_price' => $total_price,
+                        'avg_price' => 0,
+                        'amount' => $request->pair_amount,
+                        'total_price' => $total_price,
+                        'current_wage' => 0,
+                        'toman_wage' => $tether_price * $wage,
+                        'filled' => 0,
+                        'status' => OrdersList::PENDING_STATUS,
+                    ];
+
+                    $order_info = OrderRepository::storeBuyOrders($order_info);
+
+                    $order_setting = OrderSetting::checkOrderMode();
+                    if($order_setting->mode == OrderSetting::AUTOMATIC_MODE)
+                    {
+                        $coinex_order_info = [
+                            'access_id' => config('bitazar.coinex.access_id'),
+                            'market' => strtoupper($request->pair_type) . 'USDT',
+                            'type' => 'sell',
+                            'amount' => $request->pair_amount,
+                            'tonce' => now()->toDateTimeString(),
+                            'account_id' => 0,
+                            'client_id' => Auth::guard('api')->user()->mobile
                         ];
-                        switch ($request->lang)
-                        {
-                            case 'fa':
-                            default:
-                                return Response::failed('متاسفم، مقدار تتری بیشتری مورد نیاز است', $data, 422, -1);
-                            case 'en':
-                                return Response::failed('sorry, more tether are needed', $data, 422, -1);
-                        }
+
+                        SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'limit');
+                    }
+
+                    return Response::success(__('trade_exchange_success_tether_charged'), null, 200);
+
+                }
+
+            }
+        }
+//      end limit invoice or sell tether
+
+//      Limit invoice or sell exchanges
+        $exchange_setting = ExchangeSetting::getExchangeSettings();
+        switch ($exchange_setting->exchange) {
+            case 'کوینکس':
+            default:
+                // Get coinex market info for find sepcific currency and min amount and taker fee rate
+                $coinex_market_info = CoinexMarketInfoExtracted::findMarketInfo(strtoupper($request->pair_type) . 'USDT');
+                $coinex_market_info = json_decode($coinex_market_info->data);
+                $maker_fee_rate = \config('bitazar.coinex.network_wage_percent');
+
+                $invoice = [];
+                $wage = SellExchangeTrait::calculateWage($request->pair_amount, $request->pair_price, $static_percent);
+                $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $request->pair_price, $maker_fee_rate, $static_percent);
+                $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tether_price);
+                $maker_fee_rate = SellExchangeTrait::calculateNetworkWage($request->pair_amount, $maker_fee_rate, $request->pair_price);
+
+                switch ($request->receipt_type)
+                {
+                    case 'usdt':
+                    default:
+                        $invoice =  [
+                            'your_payment' => $request->pair_amount,
+                            'wage_percent' => $wage,
+                            'network_wage' => $maker_fee_rate,
+                            'currency_type_wage_percent' => 'تتر',
+                            'your_receipt' => $total_tether,
+                            'currency_type_your_receipt' => 'تتر',
+                            'currency_type' => strtoupper($request->pair_type)
+                        ];
+                        break;
+                    case 'toman':
+                        $invoice =  [
+                            'your_payment' => $request->pair_amount,
+                            'wage_percent' => $wage * $tether_price,
+                            'network_wage' => $maker_fee_rate * $tether_price,
+                            'currency_type_wage_percent' => 'تتر',
+                            'your_receipt' => $toman_amount,
+                            'currency_type_your_receipt' => 'تومان',
+                            'currency_type' => strtoupper($request->pair_type)
+                        ];
+                        break;
+                }
+
+                if($request->request_type == 'invoice') {
+
+                    return Response::success(__('trade_exchange_success_your_exchange_calculated'), $invoice, 200);
+
+                } elseif($request->request_type == 'sell'){
+
+                    $pair_freeze_amount = FreezeHelper::getFreezeAmount(strtoupper($request->pair_type));
+
+                    $user_wallet = $this->userWalletsRepository
+                        ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
+
+                    if(($user_wallet->amount - $pair_freeze_amount) < $request->pair_amount)
+                    {
+                        $required_exchange_amount  =  $request->pair_amount - ($user_wallet->amount - $pair_freeze_amount);
+                        $data = [
+                            'required_'.strtolower($request->pair_type).'_amount' => $required_exchange_amount
+                        ];
+
+                        return Response::failed(__('sell_exchange_failed_more_currency_needed'), $data, 422, -2);
 
                     }
                     else{
-                        $this->userWalletsRepository
-                            ->decreaseWalletAmount(Auth::guard('api')->id(), 'USDT', $request->pair_amount);
-                        $this->userWalletsRepository
-                            ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $total_price);
 
-                        $order_info = [
-                            'user_id' => Auth::guard('api')->id(),
-                            'time' => now(),
-                            'market' => 'USDT',
-                            'type' => OrdersList::LIMIT_TYPE,
-                            'role' => OrdersList::SELL_ROLE,
-                            'order_price' => $total_price,
-                            'avg_price' => 0,
-                            'amount' => $request->pair_amount,
-                            'total_price' => $total_price,
-                            'current_wage' => 0,
-                            'filled' => 0,
-                            'status' => OrdersList::PENDING_STATUS,
-                        ];
-
-                        OrderRepository::storeBuyOrders($order_info);
 
                         $order_setting = OrderSetting::checkOrderMode();
-                        if($order_setting->mode == 'اتوماتیک')
+                        if($order_setting->mode == OrderSetting::AUTOMATIC_MODE)
                         {
                             $coinex_order_info = [
-                                'access_id' => '1',
+                                'access_id' => config('bitazar.coinex.access_id'),
                                 'market' => strtoupper($request->pair_type) . 'USDT',
                                 'type' => 'sell',
                                 'amount' => $request->pair_amount,
+                                'price' => $request->pair_price,
                                 'tonce' => now()->toDateTimeString(),
                                 'account_id' => 0,
                                 'client_id' => Auth::guard('api')->user()->mobile
                             ];
 
-                            SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
-                        }
-                        switch ($request->lang)
-                        {
-                            case 'fa':
-                            default:
-                                return Response::success('تبریک، ولت  تتری شما با موفقیت شارژ شد', null, 200);
-                            case 'en':
-                                return Response::success('congratulation, your tether wallet has been charged', null, 200);
-                        }
-                    }
 
-                }
-            }
-//          end limit invoice or buy tether
-
-//          Limit invoice or sell exchanges
-            $exchange_setting = ExchangeSetting::getExchangeSettings();
-            switch ($exchange_setting->exchange) {
-                case 'کوینکس':
-                default:
-                    // Get coinex market info for find sepcific currency and min amount and taker fee rate
-                    $coinex_market_info = CoinexMarketInfoExtracted::findMarketInfo(strtoupper($request->pair_type) . 'USDT');
-                    $coinex_market_info = json_decode($coinex_market_info->data);
-                    $maker_fee_rate = $coinex_market_info->maker_fee_rate;
-
-                    $invoice = [];
-                    $wage = SellExchangeTrait::calculateWage($request->pair_amount, $request->pair_price, $static_percent);
-                    $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $request->pair_price, $maker_fee_rate, $static_percent);
-                    $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tetherPrice);
-                    switch ($request->receipt_type)
-                    {
-                        case 'usdt':
-                        default:
-                            $invoice =  [
-                                'your_payment' => $request->pair_amount,
-                                'wage_percent' => $wage,
-                                'your_receipt' => $total_tether,
-                                'currency_type' => 'USDT'
-                            ];
-                            break;
-                        case 'toman':
-                            $invoice =  [
-                                'your_payment' => $request->pair_amount,
-                                'wage_percent' => $wage,
-                                'your_receipt' => $toman_amount,
-                                'currency_type' => 'IRR'
-                            ];
-                            break;
-                    }
-
-                    if($request->request_type == 'invoice') {
-                        switch ($request->lang) {
-                            case 'fa':
-                            default:
-                                return Response::success('ارز مورد نظر محاسبه گردید', $invoice, 200);
-                            case 'en':
-                                return Response::success('Your exchange info calculated', $invoice, 200);
+                            $coinex_order_result = SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'limit');
                         }
-                    }
-                    elseif($request->request_type == 'sell'){
-                        $user_wallet = $this->userWalletsRepository
-                            ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
-                        if($user_wallet->amount < $request->pair_amount)
-                        {
-                            $required_exchange_amount  =  $request->pair_amount - $user_wallet->amount;
-                            $data = [
-                                'required_'.strtolower($request->pair_type).'_amount' => $required_exchange_amount
-                            ];
-                            switch ($request->lang)
-                            {
-                                case 'fa':
-                                default:
-                                    return Response::failed('متاسفم، مقدار ارز بیشتری مورد نیاز است', $data, 422, -2);
-                                case 'en':
-                                    return Response::failed('sorry, more '.strtolower($request->pair_type).' are needed', $data, 422, -2);
-                            }
-                        }
-                        else{
-                            $this->userWalletsRepository
-                                ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
-                            switch ($request->receipt_type)
-                            {
-                                case 'usdt':
-                                    $this->userWalletsRepository
-                                        ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
-                                    break;
-                                case 'toman':
-                                default:
-                                    $this->userWalletsRepository
-                                        ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
-                                    break;
-                            }
+
+
+                        if (!@$coinex_order_result->code) {
 
                             $order_info = [
                                 'user_id' => Auth::guard('api')->id(),
                                 'time' => now(),
-                                'market' => strtoupper($request->pair_type).'USDT',
+                                'market' => strtoupper($request->pair_type) . 'USDT',
                                 'type' => OrdersList::LIMIT_TYPE,
                                 'role' => OrdersList::SELL_ROLE,
-                                'order_price' => $total_tether,
+                                'order_price' => $toman_amount,
                                 'avg_price' => 0,
                                 'amount' => $request->pair_amount,
-                                'total_price' => $toman_amount,
+                                'total_price' => $total_tether,
                                 'current_wage' => $wage,
+                                'toman_wage' => $tether_price * $wage,
                                 'filled' => 0,
                                 'status' => OrdersList::PENDING_STATUS,
                             ];
+                            $order_info = OrderRepository::storeSellOrders($order_info);
 
-                            OrderRepository::storeBuyOrders($order_info);
+                            // Prepare coinex done order information (order_id is foreign key on orders_list table)
+                            $done_order_info = [
+                                'order_id' => $order_info->id,
+                                'amount' => @$coinex_order_result->amount,
+                                'asset_fee' => @$coinex_order_result->asset_fee,
+                                'avg_price' => @$coinex_order_result->avg_price,
+                                'client_id' => @$coinex_order_result->client_id,
+                                'create_time' => @$coinex_order_result->create_time,
+                                'deal_amount' => @$coinex_order_result->deal_amount,
+                                'deal_fee' => @$coinex_order_result->deal_fee,
+                                'deal_money' => @$coinex_order_result->deal_money,
+                                'fee_asset' => @$coinex_order_result->fee_asset,
+                                'fee_discount' => @$coinex_order_result->fee_discount,
+                                'finished_time' => @$coinex_order_result->finished_time,
+                                'identifier' => @$coinex_order_result->id,
+                                'left' => @$coinex_order_result->left,
+                                'maker_fee_rate' => @$coinex_order_result->maker_fee_rate,
+                                'market' => @$coinex_order_result->market,
+                                'money_fee' => @$coinex_order_result->money_fee,
+                                'order_type' => @$coinex_order_result->order_type,
+                                'price' => @$coinex_order_result->price,
+                                'status' => @$coinex_order_result->status,
+                                'stock_fee' => @$coinex_order_result->stock_fee,
+                                'taker_fee_rate' => @$coinex_order_result->taker_fee_rate,
+                                'type' => @$coinex_order_result->type
+                            ];
 
-                            $order_setting = OrderSetting::checkOrderMode();
-                            if($order_setting->mode == 'اتوماتیک')
+                            // Store done order
+                            DoneOrdersList::store($done_order_info);
+
+                            // Send message of user order
+                            SmsHelper::sendMessage(Auth::guard('api')->user()->mobile, $this->templates_id['sell_limit_order'], [$request->pair_amount, $request->pair_type]);
+
+
+                            return Response::success(__('trade_exchange_success_order'), null, 200);
+
+
+                        } else {
+
+                            $order_log = [
+                                'user_id' => Auth::guard('api')->id(),
+                                'market' => strtoupper($request->pair_type) . 'USDT',
+                                'type' => OrdersList::MARKET_TYPE,
+                                'role' => OrdersList::SELL_ROLE,
+                                'order_price' => $toman_amount,
+                                'avg_price' => 0,
+                                'amount' => $request->pair_amount,
+                                'total_price' => $total_tether,
+                                'current_wage' => $wage,
+                                'toman_wage' => $tether_price * $wage,
+                                'filled' => 0,
+                                'status' => OrdersList::CANCEL_STATUS,
+                                'request_values' => json_encode($coinex_order_info),
+                                'exchange_error' => $coinex_order_result->error
+                            ];
+
+                            OrdersLog::storeLog($order_log);
+
+                            SmsHelper::sendMessage('09122335645', $this->templates_id['coinex_error'], [Auth::guard('api')->user()->mobile . '' . OrdersList::MARKET_TYPE ,$coinex_order_result->error]);
+
+                            return Response::failed(__('trade_exchange_failed_problem_about_operation'), null, 400, -3);
+                        }
+
+                    }
+
+                }
+
+                break;
+
+            case 'کوکوین':
+                $market_info = KucoinCurrency::getLastInfo();
+                $data = json_decode($market_info->data);
+                foreach ($data->data->ticker as $market_info) {
+                    if ($market_info->symbol == strtoupper($request->pair_type) . '-USDT') {
+                        $maker_fee_rate = $market_info->makerFeeRate;
+                        $invoice = [];
+                        $wage = SellExchangeTrait::calculateWage($request->pair_amount, $request->pair_price, $static_percent);
+                        $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $request->pair_price, $maker_fee_rate, $static_percent);
+                        $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tether_price);
+                        switch ($request->receipt_type)
+                        {
+                            case 'usdt':
+                            default:
+                                $invoice =  [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $total_tether,
+                                    'currency_type_your_receipt' => 'تتر',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                            case 'toman':
+                                $invoice =  [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $toman_amount,
+                                    'currency_type_your_receipt' => 'تومان',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                        }
+
+                        if($request->request_type == 'invoice') {
+
+                            return Response::success(__('trade_exchange_success_your_exchange_calculated'), $invoice, 200);
+
+                        } elseif($request->request_type == 'sell'){
+                            $user_wallet = $this->userWalletsRepository
+                                ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
+                            if($user_wallet->amount < $request->pair_amount)
                             {
-                                $coinex_order_info = [
-                                    'access_id' => '1',
-                                    'market' => strtoupper($request->pair_type) . 'USDT',
-                                    'type' => 'sell',
-                                    'amount' => $request->pair_amount,
-                                    'tonce' => now()->toDateTimeString(),
-                                    'account_id' => 0,
-                                    'client_id' => Auth::guard('api')->user()->mobile
+                                $required_exchange_amount  =  $request->pair_amount - $user_wallet->amount;
+                                $data = [
+                                    'required_'.strtolower($request->pair_type).'_amount' => $required_exchange_amount
                                 ];
 
-                                SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
+                                return Response::failed(__('sell_exchange_failed_more_currency_needed'), $data, 422, -2);
+
                             }
-
-                            switch ($request->lang) {
-                                case 'fa':
-                                default:
-                                    return Response::success('تبریک، سفارش شما با موفقیت ثبت شد', null, 200);
-                                case 'en':
-                                    return Response::success('congratulation, your order has been registered', null, 200);
-                            }
-                        }
-
-                    }
-
-                    break;
-
-                case 'کوکوین':
-                    $market_info = KucoinCurrency::getLastInfo();
-                    $data = json_decode($market_info->data);
-                    foreach ($data->data->ticker as $market_info) {
-                        if ($market_info->symbol == strtoupper($request->pair_type) . '-USDT') {
-                            $maker_fee_rate = $market_info->makerFeeRate;
-                            $invoice = [];
-                            $wage = SellExchangeTrait::calculateWage($request->pair_amount, $request->pair_price, $static_percent);
-                            $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $request->pair_price, $maker_fee_rate, $static_percent);
-                            $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tetherPrice);
-                            switch ($request->receipt_type)
-                            {
-                                case 'usdt':
-                                default:
-                                    $invoice =  [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $total_tether,
-                                        'currency_type' => 'USDT'
-                                    ];
-                                    break;
-                                case 'toman':
-                                    $invoice =  [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $toman_amount,
-                                        'currency_type' => 'IRR'
-                                    ];
-                                    break;
-                            }
-
-                            if($request->request_type == 'invoice') {
-                                switch ($request->lang)
+                            else{
+                                $this->userWalletsRepository
+                                    ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
+                                switch ($request->receipt_type)
                                 {
-                                    case 'fa':
+                                    case 'usdt':
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
+                                        break;
+                                    case 'toman':
                                     default:
-                                        return Response::success('ارز مورد نظر محاسبه گردید', $invoice, 200);
-                                    case 'en':
-                                        return Response::success('Your exchange info calculated', $invoice, 200);
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
+                                        break;
                                 }
-                            }
-                            elseif($request->request_type == 'sell'){
-                                $user_wallet = $this->userWalletsRepository
-                                    ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
-                                if($user_wallet->amount < $request->pair_amount)
+
+                                $order_info = [
+                                    'user_id' => Auth::guard('api')->id(),
+                                    'time' => now(),
+                                    'market' => strtoupper($request->pair_type).'USDT',
+                                    'type' => OrdersList::LIMIT_TYPE,
+                                    'role' => OrdersList::SELL_ROLE,
+                                    'order_price' => $total_tether,
+                                    'avg_price' => 0,
+                                    'amount' => $request->pair_amount,
+                                    'total_price' => $toman_amount,
+                                    'current_wage' => $wage,
+                                    'toman_wage' => $tether_price * $wage,
+                                    'filled' => 0,
+                                    'status' => OrdersList::PENDING_STATUS,
+                                ];
+
+                                OrderRepository::storeBuyOrders($order_info);
+
+                                $order_setting = OrderSetting::checkOrderMode();
+                                if($order_setting->mode == OrderSetting::AUTOMATIC_MODE)
                                 {
-                                    $required_exchange_amount  =  $request->pair_amount - $user_wallet->amount;
-                                    $data = [
-                                        'required_'.strtolower($request->pair_type).'_amount' => $required_exchange_amount
-                                    ];
-                                    switch ($request->lang)
-                                    {
-                                        case 'fa':
-                                        default:
-                                            return Response::failed('متاسفم، مقدار ارز بیشتری مورد نیاز است', $data, 422, -2);
-                                        case 'en':
-                                            return Response::failed('sorry, more '.strtolower($request->pair_type).' are needed', $data, 422, -2);
-                                    }
-                                }
-                                else{
-                                    $this->userWalletsRepository
-                                        ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
-                                    switch ($request->receipt_type)
-                                    {
-                                        case 'usdt':
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
-                                            break;
-                                        case 'toman':
-                                        default:
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
-                                            break;
-                                    }
-
-                                    $order_info = [
-                                        'user_id' => Auth::guard('api')->id(),
-                                        'time' => now(),
-                                        'market' => strtoupper($request->pair_type).'USDT',
-                                        'type' => OrdersList::LIMIT_TYPE,
-                                        'role' => OrdersList::SELL_ROLE,
-                                        'order_price' => $total_tether,
-                                        'avg_price' => 0,
+                                    $coinex_order_info = [
+                                        'access_id' => config('bitazar.coinex.access_id'),
+                                        'market' => strtoupper($request->pair_type) . 'USDT',
+                                        'type' => 'sell',
                                         'amount' => $request->pair_amount,
-                                        'total_price' => $toman_amount,
-                                        'current_wage' => $wage,
-                                        'filled' => 0,
-                                        'status' => OrdersList::PENDING_STATUS,
+                                        'tonce' => now()->toDateTimeString(),
+                                        'account_id' => 0,
+                                        'client_id' => Auth::guard('api')->user()->mobile
                                     ];
 
-                                    OrderRepository::storeBuyOrders($order_info);
-
-                                    $order_setting = OrderSetting::checkOrderMode();
-                                    if($order_setting->mode == 'اتوماتیک')
-                                    {
-                                        $coinex_order_info = [
-                                            'access_id' => '1',
-                                            'market' => strtoupper($request->pair_type) . 'USDT',
-                                            'type' => 'sell',
-                                            'amount' => $request->pair_amount,
-                                            'tonce' => now()->toDateTimeString(),
-                                            'account_id' => 0,
-                                            'client_id' => Auth::guard('api')->user()->mobile
-                                        ];
-
-                                        SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
-                                    }
-
-                                    switch ($request->lang)
-                                    {
-                                        case 'fa':
-                                        default:
-                                            return Response::success('تبریک، سفارش شما با موفقیت ثبت شد', null, 200);
-                                        case 'en':
-                                            return Response::success('congratulation, your order has been registered', null, 200);
-                                    }
+                                    SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'limit');
                                 }
+
+
+                                return Response::success(__('sell_exchange_success_sold'), null, 200);
 
                             }
+
                         }
                     }
-                    break;
+                }
+                break;
 
-                case 'بایننس':
-                    $market_info = BinanceCurrency::getLastInfo();
-                    $data = json_decode($market_info->data);
-                    foreach ($data as $market_info) {
-                        if ($market_info->symbol == strtoupper($request->pair_type) . 'USDT') {
-                            $maker_fee_rate = ($request->pair_amount * $request->pair_price) * 0.1;
-                            $invoice = [];
-                            $wage = SellExchangeTrait::calculateWage($request->pair_amount, $request->pair_price, $static_percent);
-                            $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $request->pair_price, $maker_fee_rate, $static_percent);
-                            $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tetherPrice);
-                            switch ($request->receipt_type)
+            case 'بایننس':
+                $market_info = BinanceCurrency::getLastInfo();
+                $data = json_decode($market_info->data);
+                foreach ($data as $market_info) {
+                    if ($market_info->symbol == strtoupper($request->pair_type) . 'USDT') {
+                        $maker_fee_rate = ($request->pair_amount * $request->pair_price) * 0.1;
+                        $invoice = [];
+                        $wage = SellExchangeTrait::calculateWage($request->pair_amount, $request->pair_price, $static_percent);
+                        $total_tether = SellExchangeTrait::calculateTotalTether($request->pair_amount, $request->pair_price, $maker_fee_rate, $static_percent);
+                        $toman_amount = SellExchangeTrait::calculateTomanAmount($total_tether, $tether_price);
+                        switch ($request->receipt_type)
+                        {
+                            case 'usdt':
+                            default:
+                                $invoice =  [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $total_tether,
+                                    'currency_type_your_receipt' => 'تتر',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                            case 'toman':
+                                $invoice =  [
+                                    'your_payment' => $request->pair_amount,
+                                    'wage_percent' => $wage,
+                                    'currency_type_wage_percent' => 'تتر',
+                                    'your_receipt' => $toman_amount,
+                                    'currency_type_your_receipt' => 'تومان',
+                                    'currency_type' => strtoupper($request->pair_type)
+                                ];
+                                break;
+                        }
+
+                        if($request->request_type == 'invoice') {
+
+                            return Response::success(__('trade_exchange_success_your_exchange_calculated'), $invoice, 200);
+
+                        } elseif($request->request_type == 'sell'){
+                            $user_wallet = $this->userWalletsRepository
+                                ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
+                            if($user_wallet->amount < $request->pair_amount)
                             {
-                                case 'usdt':
-                                default:
-                                    $invoice =  [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $total_tether,
-                                        'currency_type' => 'USDT'
-                                    ];
-                                    break;
-                                case 'toman':
-                                    $invoice =  [
-                                        'your_payment' => $request->pair_amount,
-                                        'wage_percent' => $wage,
-                                        'your_receipt' => $toman_amount,
-                                        'currency_type' => 'IRR'
-                                    ];
-                                    break;
-                            }
+                                $required_exchange_amount  =  $request->pair_amount - $user_wallet->amount;
+                                $data = [
+                                    'required_'.strtolower($request->pair_type).'_amount' => $required_exchange_amount
+                                ];
 
-                            if($request->request_type == 'invoice') {
-                                switch ($request->lang)
+                                return Response::failed(__('sell_exchange_failed_more_currency_needed'), $data, 422, -2);
+
+                            }
+                            else{
+                                $this->userWalletsRepository
+                                    ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
+                                switch ($request->receipt_type)
                                 {
-                                    case 'fa':
+                                    case 'usdt':
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
+                                        break;
+                                    case 'toman':
                                     default:
-                                        return Response::success('ارز مورد نظر محاسبه گردید', $invoice, 200);
-                                    case 'en':
-                                        return Response::success('Your exchange info calculated', $invoice, 200);
+                                        $this->userWalletsRepository
+                                            ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
+                                        break;
                                 }
-                            }
-                            elseif($request->request_type == 'sell'){
-                                $user_wallet = $this->userWalletsRepository
-                                    ->getUserWallet(Auth::guard('api')->id(), strtoupper($request->pair_type));
-                                if($user_wallet->amount < $request->pair_amount)
+
+                                $order_info = [
+                                    'user_id' => Auth::guard('api')->id(),
+                                    'time' => now(),
+                                    'market' => strtoupper($request->pair_type).'USDT',
+                                    'type' => OrdersList::LIMIT_TYPE,
+                                    'role' => OrdersList::SELL_ROLE,
+                                    'order_price' => $total_tether,
+                                    'avg_price' => 0,
+                                    'amount' => $request->pair_amount,
+                                    'total_price' => $toman_amount,
+                                    'current_wage' => $wage,
+                                    'toman_wage' => $tether_price * $wage,
+                                    'filled' => 0,
+                                    'status' => OrdersList::PENDING_STATUS,
+                                ];
+
+                                OrderRepository::storeBuyOrders($order_info);
+
+                                $order_setting = OrderSetting::checkOrderMode();
+                                if($order_setting->mode == OrderSetting::AUTOMATIC_MODE)
                                 {
-                                    $required_exchange_amount  =  $request->pair_amount - $user_wallet->amount;
-                                    $data = [
-                                        'required_'.strtolower($request->pair_type).'_amount' => $required_exchange_amount
-                                    ];
-                                    switch ($request->lang)
-                                    {
-                                        case 'fa':
-                                        default:
-                                            return Response::failed('متاسفم، مقدار ارز بیشتری مورد نیاز است', $data, 422, -2);
-                                        case 'en':
-                                            return Response::failed('sorry, more '.strtolower($request->pair_type).' are needed', $data, 422, -2);
-                                    }
-                                }
-                                else{
-                                    $this->userWalletsRepository
-                                        ->decreaseWalletAmount(Auth::guard('api')->id(), strtoupper($request->pair_type), $request->pair_amount);
-                                    switch ($request->receipt_type)
-                                    {
-                                        case 'usdt':
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'USDT', $total_tether);
-                                            break;
-                                        case 'toman':
-                                        default:
-                                            $this->userWalletsRepository
-                                                ->increaseWalletAmount(Auth::guard('api')->id(), 'IRR', $toman_amount);
-                                            break;
-                                    }
-
-                                    $order_info = [
-                                        'user_id' => Auth::guard('api')->id(),
-                                        'time' => now(),
-                                        'market' => strtoupper($request->pair_type).'USDT',
-                                        'type' => OrdersList::LIMIT_TYPE,
-                                        'role' => OrdersList::SELL_ROLE,
-                                        'order_price' => $total_tether,
-                                        'avg_price' => 0,
+                                    $coinex_order_info = [
+                                        'access_id' => config('bitazar.coinex.access_id'),
+                                        'market' => strtoupper($request->pair_type) . 'USDT',
+                                        'type' => 'sell',
                                         'amount' => $request->pair_amount,
-                                        'total_price' => $toman_amount,
-                                        'current_wage' => $wage,
-                                        'filled' => 0,
-                                        'status' => OrdersList::PENDING_STATUS,
+                                        'tonce' => now()->toDateTimeString(),
+                                        'account_id' => 0,
+                                        'client_id' => Auth::guard('api')->user()->mobile
                                     ];
 
-                                    OrderRepository::storeBuyOrders($order_info);
-
-                                    $order_setting = OrderSetting::checkOrderMode();
-                                    if($order_setting->mode == 'اتوماتیک')
-                                    {
-                                        $coinex_order_info = [
-                                            'access_id' => '1',
-                                            'market' => strtoupper($request->pair_type) . 'USDT',
-                                            'type' => 'sell',
-                                            'amount' => $request->pair_amount,
-                                            'tonce' => now()->toDateTimeString(),
-                                            'account_id' => 0,
-                                            'client_id' => Auth::guard('api')->user()->mobile
-                                        ];
-
-                                        SellExchangeTrait::SellOrderCoinex($coinex_order_info, $request->type, @$request->lang);
-                                    }
-
-                                    switch ($request->lang)
-                                    {
-                                        case 'fa':
-                                        default:
-                                            return Response::success('تبریک، سفارش شما با موفقیت ثبت شد', null, 200);
-                                        case 'en':
-                                            return Response::success('congratulation, your order has been registered', null, 200);
-                                    }
+                                    SellExchangeTrait::SellOrderCoinex($coinex_order_info, 'limit');
                                 }
+
+
+                                return Response::success(__('sell_exchange_success_sold'), null, 200);
 
                             }
+
                         }
                     }
-                    break;
-            }
-
-//          end limit invoice or buy exchanges
+                }
+                break;
         }
 
-
     }
-
 
 }

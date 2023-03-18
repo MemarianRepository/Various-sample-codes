@@ -2,273 +2,232 @@
 
 namespace App\Models;
 
-use App\Models\Api\v1\News;
-use App\Models\Api\v1\bank_card;
-use App\Models\Api\v1\OrdersList;
-use App\Models\Api\v1\score_user;
-use Spatie\MediaLibrary\HasMedia;
-use App\Models\Api\v1\InviteCodes;
-use App\Models\Api\v1\user_wallet;
-use App\Models\Api\v1\UserWallets;
+use App\Helpers\CacheHelper;
+use App\Models\Api\v1\Basket;
+use App\Models\Api\v1\UserLink;
+use App\Models\Api\v1\UserProduct;
 use Laravel\Passport\HasApiTokens;
-use App\Models\Api\v1\ExchangeList;
-use App\Models\Api\v1\ManualDeposit;
-use App\Models\Api\v1\ScoreExchange;
-use Illuminate\Support\Facades\Auth;
-use App\Models\Api\v1\TomanWithdraws;
-use Spatie\Permission\Traits\HasRoles;
-use App\Models\Api\v1\ManualWithdrawal;
-use App\Models\Api\v1\UserFinancialInfo;
-use App\Models\Presenters\UserPresenter;
+use App\Models\Api\v1\ProductWallet;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Notifications\Notifiable;
-use App\Models\Traits\HasHashedMediaTrait;
-use App\Models\Api\v1\TomanWithdrawHistory;
-use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Contracts\Auth\MustVerifyEmail;
-use App\Notifications\ResetPasswordNotification;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 
-class User extends Authenticatable implements MustVerifyEmail
+class User extends Authenticatable
 {
-    const STATUS_ACTIVATE = 1;
-    const STATUS_DACTIVE = 0;
+    use HasApiTokens, HasFactory, Notifiable;
 
-    const ROLE_USER = 1;
-    const ROLE_ADMIN = 2;
+    const SALAMASAL = 'SALAM';
+    const EHYAKHAK = 'EHYAKHAK';
+    const PARTNER = 'PARTNER';
 
-    const ACCESS_LEVEL_BEONZ = 0;
-    const ACCESS_LEVEL_SILVER = 1;
-    const ACCESS_LEVEL_GOLD = 2;
-
-    use HasApiTokens;
-    use HasFactory;
-    use Notifiable;
-    use SoftDeletes;
-
-
-    public $fillable = [
-        'first_name',
+    protected $fillable = [
+        'name',
         'last_name',
-        'gender',
-        'access_level',
-        'mobile' ,
-        'status',
-        'role',
-        'ip_address',
-        'affiliate_id',
+        'mobile',
         'activation_code',
-        'password',
-        'referred_by',
-        'affiliate_id',
         'email',
-        'username',
-       	'google2fa_secret'
+        'password',
     ];
 
-
-    protected $guarded = [
-        'id',
-        'updated_at',
-        '_token',
-        '_method',
-        'password_confirmation',
-    ];
-
-    protected $dates = [
-        'deleted_at',
-        'date_of_birth',
-        'email_verified_at',
-    ];
-
-    /**
-     * The attributes that should be hidden for arrays.
-     *
-     * @var array
-     */
     protected $hidden = [
-        'password', 'remember_token',
+        'password',
+        'remember_token',
     ];
 
-    /**
-     * @return \Illuminate\Database\Eloquent\Relations\HasMany
-     */
-    public function providers(): \Illuminate\Database\Eloquent\Relations\HasMany
+    protected $casts = [
+        'email_verified_at' => 'datetime',
+    ];
+
+    public static function store($name, $lastname, $email, $mobile, $partner_id)
     {
-        return $this->hasMany('App\Models\UserProvider');
-    }
+        $user = self::query()->where([
+            'mobile' => $mobile,
+            'status' => '1'
+        ])->first();
 
-    /**
-     * @return \Illuminate\Database\Eloquent\Relations\HasMany
-     */
-    public function profile()
-    {
-        return $this->hasOne('App\Models\Userprofile');
-    }
-
-    /**
-     * @return \Illuminate\Database\Eloquent\Relations\HasMany
-     */
-    public function userprofile()
-    {
-        return $this->hasOne('App\Models\Userprofile');
-    }
-
-    /**
-     * Get the list of users related to the current User.
-     *
-     * @return [array] roels
-     */
-    public function getRolesListAttribute(): array
-    {
-        return array_map('intval', $this->roles->pluck('id')->toArray());
-    }
-
-    /**
-     * Route notifications for the Slack channel.
-     *
-     * @param \Illuminate\Notifications\Notification $notification
-     *
-     * @return string
-     */
-    public function routeNotificationForSlack($notification): string
-    {
-        return env('SLACK_NOTIFICATION_WEBHOOK');
-    }
-
-    public function userUpgradeLists(): \Illuminate\Database\Eloquent\Relations\HasMany
-    {
-        return $this->hasMany('App\Models\Api\v1\UserUpgrade');
-    }
-
-    public function invited(): \Illuminate\Database\Eloquent\Relations\HasMany
-    {
-        return $this->hasMany(invited_user::class, 'base_user', 'id');
-    }
-
-    public function was_invited(): \Illuminate\Database\Eloquent\Relations\HasMany
-    {
-        return $this->hasMany(invited_user::class, 'invited_user', 'id');
-    }
-
-   public function news()
-    {
-        return $this->hasMany(News::class,'id', 'author_id');
-    }
-
-
-    public function get_invite_url(): string
-    {
-        return url("/")."/?ref={$this->affiliate_id}";
-    }
-
-    public function user(){
-        return $this->belongsTo(User::class, 'user_id', 'id');
-    }
-
-    public function username()
-    {
-        return 'email';
-    }
-
-    public function userWallet()
-    {
-        return $this->hasMany(UserWallets::class, 'user_id', 'id');
-    }
-  	public function user_scores(){
-        return $this->hasMany(score_user::class, 'user_id', 'id');
-    }
-
-  	public function wallets(){
-        return $this->hasMany(user_wallet::class, 'user_id', 'id');
-    }
-
-    public function cards(){
-        return $this->hasMany(UserFinancialInfo::class, 'user_id', 'id');
-    }
-
-    public function tomanwithdraws(){
-        return $this->hasMany(TomanWithdraws::class, 'user_id', 'id');
-    }
-
-    public function orders(){
-        return $this->hasMany(OrdersList::class, 'user_id', 'id');
-    }
-
-    public function invitation_codes(){
-        return $this->hasMany(InviteCodes::class, 'user_id', 'id');
-    }
-    public function score_exchanges(){
-        return $this->hasMany(ScoreExchange::class, 'user_id', "id");
-    }
-
-    // Insert user secret key for google authenticator
-    public static function insertSecretKey($user_id, $secret_key)
-    {
-        $user = User::query()->find($user_id);
-        $user->google2fa_secret = $secret_key;
-        $user->save();
-    }
-
-    public static function storeById($user_id, $ip)
-    {
-        $user = User::query()->find($user_id);
-        $user->status = User::STATUS_ACTIVATE;
-        $user->username = @$user->username;
-        $user->ip_address = $ip;
-        $user->role = User::ROLE_USER;
-        $user->access_level = User::ACCESS_LEVEL_BEONZ;
-        $user->save();
-    }
-
-    public static function findById($user_id)
-    {
-        return self::query()->find($user_id);
-    }
-
-    public function withdraws(){
-        return $this->hasMany(ManualWithdrawal::class, 'user_id', 'id');
-    }
-
-    public function deposits(){
-        return $this->hasMany(ManualDeposit::class, 'user_id', 'id');
-    }
-
-    public function toman_withdraw_history(){
-        return $this->hasMany(TomanWithdrawHistory::class, 'user_id', 'id');
-    }
-
-    public static function increaseWalletAmount($user_id, $wallet_name, $amount)
-    {
-        $user_wallet = UserWallets::query()
-            ->where([
-                'user_id' => $user_id,
-                'wallet' => $wallet_name,
-            ])->first();
-        if(!$user_wallet){
-            $exchange = ExchangeList::query()->where('symbol', $wallet_name)->first(['id']);
-            $user_wallet = new UserWallets;
-            $user_wallet->user_id = $user_id;
-            $user_wallet->exchange_id = $exchange->id;
-            $user_wallet->amount = $amount;
-            $user_wallet->wallet = $wallet_name;
-            $user_wallet->status = 1;
-            $user_wallet->save();
-            return;
+        if (!$user) {
+            $user = new self;
+            $user->name = $name;
+            $user->last_name = $lastname;
+            $user->email = $email;
+            $user->password = bcrypt('12345678');
+            $user->mobile = $mobile;
+            $user->partner_id = $partner_id;
+            $user->reference_site = self::PARTNER;
+            $user->status = '0';
+            $user->save();
         }
-        $user_wallet->amount += $amount;
-        $user_wallet->save();
+
+        return $user->id;
+
     }
 
-    public static function decreaseWalletAmount($user_id, $wallet_name, $amount)
+    public static function setIncremental($user_id, $amount, $type)
     {
-        $user_wallet = UserWallets::query()
-            ->where([
-                'user_id' => $user_id,
-                'wallet' => $wallet_name,
-            ])->first();
-        $user_wallet->amount = abs($amount - $user_wallet->amount);
-        $user_wallet->save();
+        $user = self::query()->find($user_id);
+        $user->incremental_amount = $amount;
+        $user->incremental_type = $type;
+        $user->save();
     }
+
+    public static function setDecreasing($user_id, $amount, $type)
+    {
+        $user = self::query()->find($user_id);
+        $user->decreasing_amount = $amount;
+        $user->decreasing_type = $type;
+        $user->save();
+    }
+
+    public static function emptyIncremental($user_id)
+    {
+        $user = self::query()->find($user_id);
+        $user->incremental_amount = null;
+        $user->incremental_type = null;
+        $user->save();
+    }
+
+    public static function emptyDecreasing($user_id)
+    {
+        $user = self::query()->find($user_id);
+        $user->decreasing_amount = null;
+        $user->decreasing_type = null;
+        $user->save();
+    }
+
+    public static function getIncremental($user_id)
+    {
+        return self::query()->find($user_id, ['incremental_amount', 'incremental_type', 'partner_id', 'id']);
+    }
+
+    public static function getDecreasing($user_id)
+    {
+        return self::query()->find($user_id, ['decreasing_amount', 'decreasing_type', 'id']);
+    }
+
+    public function basket(): \Illuminate\Database\Eloquent\Relations\HasOne
+    {
+        return $this->hasOne(Basket::class)->latestOfMany();
+    }
+
+    public function baskets()
+    {
+        return $this->hasMany(Basket::class, 'user_id', 'id')->where('status', '0');
+    }
+
+    public static function changeStatus($id)
+    {
+        $user = self::query()->find($id);
+        $user->status = '1';
+        $user->save();
+    }
+
+    // Check user activation code
+    public static function checkActivationCode($activation_code, $mobile)
+    {
+        // Check expire time of activation code
+        if (CacheHelper::checkCache($activation_code)) {
+            return User::query()
+                ->where('activation_code', $activation_code)
+                ->where('mobile', $mobile)
+                ->first();
+        }
+    }
+
+    // Update new password of user
+    public static function updateNewPassword($mobile, $new_password)
+    {
+        $user = User::query()->where('mobile', $mobile)->first();
+        $user->password = bcrypt($new_password);
+        $user->save();
+    }
+
+    public static function checkActivationCodeWithoutTime($activation_code, $status)
+    {
+        return User::query()
+            ->where('activation_code', $activation_code)
+            ->where('status', $status)
+            ->first();
+    }
+
+    public static function insertUserMobile($mobile): bool
+    {
+        $user = User::query()
+            ->where('mobile', $mobile)
+            ->first();
+        if (empty($user)){
+            $user = new User;
+            $user->mobile = $mobile;
+            $user->save();
+            return true;
+        }
+        elseif ($user->status == 0 || $user->status == null) {
+            $user->mobile = $mobile;
+            $user->save();
+            return true;
+        }
+        return false;
+    }
+
+    public static function insertUserInfo($user, $name, $lastname)
+    {
+        $user->name = $name;
+        $user->last_name = $lastname;
+        $user->save();
+    }
+
+    public static function insertUserPassword($user, $password, $reference_site)
+    {
+        $user->reference_site = $reference_site;
+        $user->password = bcrypt($password);
+        $user->status = '1';
+        $user->save();
+    }
+
+    public static function checkUserPassword($mobile, $password)
+    {
+        $user = User::query()->where('mobile', $mobile)->first('password');
+        if($user)
+            if(Hash::check($password, $user->password))
+                return true;
+    }
+
+    public static function findUserByMobile($mobile)
+    {
+        return User::query()->where('mobile', $mobile)->first();
+    }
+
+    public static function updateUserMobile($old_mobile, $new_mobile): bool
+    {
+        $mobile_exist = self::query()->where('mobile', $new_mobile)->where('status', '1')->first();
+        if ($mobile_exist)
+            return true;
+        else {
+
+            $user = self::query()->where('mobile', $old_mobile)->first();
+            $user->mobile = $new_mobile;
+            $user->save();
+            return false;
+        }
+
+    }
+
+    public function user_product()
+    {
+        $this->hasMany(UserProduct::class,'user_id');
+    }
+
+    public static function checkUserExist($mobile)
+    {
+        return User::query()->where('mobile', $mobile)->where('status', '1')->first();
+    }
+
+    public static function find($id)
+    {
+        return self::query()->find($id);
+    }
+
 
 }

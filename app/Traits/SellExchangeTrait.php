@@ -3,23 +3,31 @@
 
 namespace App\Traits;
 
+use App\Helpers\RequestHelper;
 use App\Jobs\SellOrder;
 use Lin\Coinex\CoinexExchange;
 
 Trait SellExchangeTrait{
 
-    public static function calculateTotalTether($pair_amount, $exchange_price = null, $taker_fee_rate, $static_percent)
+    public static function calculateTotalTether($pair_amount, $currency_price = null, $maker_fee_rate, $static_percent)
     {
-        $totalTheter = $exchange_price * $pair_amount;
-        $wage = ($static_percent / 100) * $totalTheter;
-        return $totalTheter + $wage + $taker_fee_rate;
+        $total_tether = $currency_price * $pair_amount;
+        $wage = ($static_percent / 100) * $total_tether;
+        $maker_fee_rate = ($maker_fee_rate / 100) * $total_tether;
+        return $total_tether + $wage + $maker_fee_rate;
     }
 
-    public static function calculateWage($pair_amount, $exchange_price = null, $static_percent)
+    public static function calculateWage($pair_amount, $currency_price = null, $static_percent)
     {
-        $totalTheter = $exchange_price * $pair_amount;
-        return ($static_percent / 100) * $totalTheter;
+        $total_tether = $currency_price * $pair_amount;
+        return ($static_percent / 100) * $total_tether;
 
+    }
+
+    public static function calculateNetworkWage($pair_amount, $maker_fee_rate, $pair_price = null)
+    {
+            $total_tether = $pair_amount * $pair_price;
+            return ($maker_fee_rate / 100) * $total_tether;
     }
 
     public static function calculateTomanAmount($total_tether, $tether_price)
@@ -27,12 +35,11 @@ Trait SellExchangeTrait{
         return $tether_price * $total_tether;
     }
 
-    public static function SellOrderCoinex($coinex_order_info, $type, $lang)
+    public static function SellOrderCoinex($coinex_order_info, $type, $extra_information = [])
     {
+     
+
         if ($type == 'market') {
-            $key = '420507A8F0DC40249423722D4EF81ED1';
-            $secret = 'A3CE29DEB945AA91743A2F6F5805F1F9574D992ABA72731F';
-            $coinex = new CoinexExchange($key, $secret);
 
             $data = [
                 'access_id' => $coinex_order_info['access_id'],
@@ -41,266 +48,126 @@ Trait SellExchangeTrait{
                 'type' => $coinex_order_info['type'],
                 'amount' => $coinex_order_info['amount'],
                 'client_id' => $coinex_order_info['client_id'],
-
             ];
 
-            $result = $coinex->trading()->postMarket($data);
+            $result = RequestHelper::send('https://api.coinex.com/v1/order/market', 'post',  $data, $data);
 
             // Try 3 times
             $i = 0;
-            while ($result['code'] != 0) {
+            while ($result->code != 0) {
                 if ($i < 3)
                     break;
-                $result = $coinex->trading()->postMarket($data);
+                $result = RequestHelper::send('https://api.coinex.com/v1/order/market', 'post',  $data, $data);
                 $i++;
             }
 
-            if ($result['code'] != 0)
-                return self::coinexErrorDetection($result['code'], $lang);
-            elseif ($result['code'] == 0)
-                return $result['data'];
+            if ($result->code != 0)
+                return self::coinexErrorDetection($result->code);
+            elseif ($result->code == 0)
+                return $result->data;
 
 
         } else {
-            SellOrder::dispatch($coinex_order_info, $type)->onQueue('sellOrder');
-            return 0;
+
+            // prepare data for request
+            $data = [
+                'access_id'=>$coinex_order_info['access_id'],
+                'tonce'=>$coinex_order_info['tonce'],
+                'market'=>$coinex_order_info['market'],
+                'type'=>$coinex_order_info['type'],
+                'amount'=>$coinex_order_info['amount'],
+                'price' => $coinex_order_info['price'],
+                'client_id'=>$coinex_order_info['client_id'],
+            ];
+            $result = RequestHelper::send('https://api.coinex.com/v1/order/limit', 'post',  $data, $data);
+
+            // Try 3 times
+            $i = 0;
+            while ($result->code != 0) {
+                if ($i < 3)
+                    break;
+                $result = RequestHelper::send('https://api.coinex.com/v1/order/limit', 'post',  $data, $data);
+                $i++;
+            }
+
+            // Detect request result
+            if ($result->code != 0)
+                return self::coinexErrorDetection($result->code);
+            elseif ($result->code == 0)
+                return $result->data;
+
         }
     }
 
-    public static function coinexErrorDetection($error_code, $lang): array
+    public static function coinexErrorDetection($error_code): object
     {
+        $error = null;
         switch ($error_code) {
             case 1:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'خطا';
-                        break;
-                    case 'en':
-                        $error = 'Error';
-                        break;
-                }
+                $error = __('coinex_error_one');
                 break;
             case 2:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'آرکومان ها نا معتبر هستن';
-                        break;
-                    case 'en':
-                        $error = 'Invalid argument';
-                        break;
-                }
+                $error = __('coinex_error_two');
                 break;
             case 3:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'خطای داخلی';
-                        break;
-                    case 'en':
-                        $error = 'Internal error';
-                        break;
-                }
+                $error = __('coinex_error_three');
                 break;
             case 23:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'آدرس IP ممنوع می باشد';
-                        break;
-                    case 'en':
-                        $error = 'IP prohibited';
-                        break;
-                }
+                $error = __('coinex_error_twenty_three');
                 break;
             case 24:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'موجود نمی باشد' . ' AcessesID';
-                        break;
-                    case 'en':
-                        $error = 'AccessID does not exist';
-                }
+                $error = __('coinex_error_twenty_four');
                 break;
             case 25:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'Signature ' . 'خطای';
-                        break;
-                    case 'en':
-                        $error = 'Signature error';
-                }
+                $error = __('coinex_error_twenty_five');
                 break;
             case 34:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'منقضی شده است';
-                        break;
-                    case 'en':
-                        $error = 'AccessID expired';
-                        break;
-                }
+                $error = __('coinex_error_thirty_four');
                 break;
             case 35:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'سرویس در دسترس نیست';
-                        break;
-                    case 'en':
-                        $error = 'Service unavailable';
-                        break;
-                }
+                $error = __('coinex_error_thirty_five');
                 break;
             case 36:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'پایان سرویس';
-                        break;
-                    case 'en':
-                        $error = 'Service timeout';
-                        break;
-                }
+                $error = __('coinex_error_thirty_six');
                 break;
             case 40:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'حساب اصلی و حساب فرعی مطابقت ندارند';
-                        break;
-                    case 'en':
-                        $error = 'Main account and sub-account do not match';
-                        break;
-                }
+                $error = __('coinex_error_forty');
                 break;
             case 49:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'انتقال به حساب فرعی رد شد';
-                        break;
-                    case 'en':
-                        $error = 'The transfer to the sub-account was rejected';
-                        break;
-                }
+                $error = __('coinex_error_forty_nine');
                 break;
             case 107:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'موجودی ناکافی است';
-                        break;
-                    case 'en':
-                        $error = 'Insufficient balance';
-                        break;
-                }
+                $error = __('coinex_error_one_hundred_and_seven');
                 break;
             case 158:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'دسترسی برای استفاده ازین API نیست';
-                        break;
-                    case 'en':
-                        $error = 'No permission to use this API';
-                        break;
-                }
+                $error = __('coinex_error_one_hundred_and_fifty_eight');
                 break;
             case 213:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'درخواست‌ها خیلی مکرر ارسال می‌شوند';
-                        break;
-                    case 'en':
-                        $error = 'Requests submitted too frequently';
-                        break;
-                }
+                $error = __('coinex_error_two_hundred_and_thirteen');
                 break;
             case 227:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'اشتباه است، timestamp باید در بازه زمانی 60± سرور باشد' . ' timestamp';
-                        break;
-                    case 'en':
-                        $error = 'The timestamp is wrong, the timestamp must be within ±60s of the server time';
-                        break;
-                }
+                $error = __('coinex_error_two_hundred_and_twenty_seven');
                 break;
             case 600:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'عدد سفارش موجود نیست';
-                        break;
-                    case 'en':
-                        $error = 'Order number does not exist';
-                        break;
-                }
+                $error = __('coinex_error_six_hundred');
                 break;
             case 601:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'سفارشات سایر کاربران';
-                        break;
-                    case 'en':
-                        $error = 'Other users’ orders';
-                        break;
-                }
+                $error = __('coinex_error_six_hundred_and_one');
                 break;
             case 602:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'زیر حداقل حد خرید یا فروش';
-                        break;
-                    case 'en':
-                        $error = 'Below the minimum buying or selling limit';
-                        break;
-                }
+                $error = __('coinex_error_six_hundred_and_two');
                 break;
             case 606:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'قیمت سفارش خیلی از آخرین قیمت معامله انحراف دارد';
-                        break;
-                    case 'en':
-                        $error = 'The order price deviates too much from the latest transaction price';
-                        break;
-                }
+                $error = __('coinex_error_six_hundred_and_six');
                 break;
             case 651:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'خطای عمق ادغام';
-                        break;
-                    case 'en':
-                        $error = 'Merge depth error';
-                        break;
-                }
+                $error = __('coinex_error_six_hundred_and_fifty_one');
                 break;
             case 3008:
-                switch ($lang) {
-                    case 'fa':
-                    default:
-                        $error = 'سرویس مشغول است، لطفاً بعداً دوباره امتحان کنید';
-                        break;
-                    case 'en':
-                        $error = 'Service busy, please try again later.';
-                        break;
-                }
+                $error = __('coinex_error_three_thousand_eight');
                 break;
         }
-        return [
+        return (object)[
             'code' => $error_code,
             'error' => $error,
         ];
